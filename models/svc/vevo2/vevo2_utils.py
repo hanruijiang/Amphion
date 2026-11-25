@@ -3,16 +3,13 @@ import json
 import librosa
 import torch
 import torchaudio
+import soundfile as sf
 import accelerate
-import safetensors
 import numpy as np
 import os
-import yaml
-from IPython.display import display, Audio
 
 import torchvision
 import random
-import numpy as np
 import whisper
 from librosa.feature import chroma_stft
 from librosa.effects import pitch_shift
@@ -24,9 +21,9 @@ from models.codec.amphion_codec.vocos import Vocos
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from utils.util import load_config
+from models.svc.vevo2.config import load_config
 from models.svc.vevo2.qwen_utils import gen_chat_prompt
-from evaluation.metrics.f0.f0_corr import extract_f0_hz
+from models.svc.vevo2.pitch import extract_f0_hz
 
 from transformers.utils import is_flash_attn_2_available
 
@@ -154,10 +151,6 @@ def load_wav(wav_path, device, used_duration=None):
     return speech, speech_tensor, speech16k
 
 
-def display_audio_in_notebook(wav, rate=24000):
-    display(Audio(wav, rate=rate))
-
-
 def save_audio(
     waveform, sr=24000, output_path=None, target_sample_rate=None, target_db=-25.0
 ):
@@ -178,7 +171,7 @@ def save_audio(
     gain = target_db - current_db
     normalized_waveform = waveform * (10 ** (gain / 20))
 
-    torchaudio.save(output_path, normalized_waveform, target_sample_rate)
+    sf.write(output_path, normalized_waveform.squeeze(0).cpu().numpy(), target_sample_rate)
     return output_path
 
 
@@ -259,6 +252,10 @@ class Vevo2InferencePipeline:
 
         if fmt_cfg_path is not None and fmt_ckpt_path is not None:
             self.fmt_cfg = load_config(fmt_cfg_path)
+            # The published config refers to the removed VevoSing source tree.
+            self.fmt_cfg.model.coco.whisper_stats_path = os.path.join(
+                os.path.dirname(fmt_cfg_path), "whisper_stats.pt"
+            )
             self.fmt_model = load_checkpoint(
                 build_fmt_model, self.fmt_cfg, fmt_ckpt_path, device
             )
@@ -528,10 +525,8 @@ class Vevo2InferencePipeline:
             print("-" * 20)
             if src_wav_path == timbre_ref_wav_path:
                 print("We want to reconstruct this audio:", src_wav_path)
-                display_audio_in_notebook(src_wav_path, rate=24000)
             else:
                 print("Source audio:")
-                display_audio_in_notebook(src_speech, rate=24000)
 
         ## Whether to use shifted src to extract prosody and content-style ##
         if use_pitch_shift:
@@ -650,7 +645,6 @@ class Vevo2InferencePipeline:
             if logging:
                 print("-" * 20)
                 print("Prosody (Melody) Audio: ", prosody_wav_path)
-                display_audio_in_notebook(prosody_speech, rate=24000)
 
         else:
             raise NotImplementedError("Not implemented yet")
@@ -673,7 +667,6 @@ class Vevo2InferencePipeline:
         if logging:
             print("-" * 20)
             print("Style Reference Audio: ", style_ref_wav_path)
-            display_audio_in_notebook(style_ref_speech, rate=24000)
 
         prompt_output_ids = self.extract_coco_codec(
             "content_style",
@@ -738,7 +731,6 @@ class Vevo2InferencePipeline:
         if logging:
             print("-" * 20)
             print("Timbre Reference Audio: ", timbre_ref_wav_path)
-            display_audio_in_notebook(timbre_ref_speech, rate=24000)
 
         timbre_ref_codecs = self.extract_coco_codec(
             "content_style",
@@ -794,9 +786,6 @@ class Vevo2InferencePipeline:
         if logging:
             print("-" * 20)
             print("Synthesized Audio:")
-            # [T]
-            audio = synthesized_audio.numpy()[0]
-            display_audio_in_notebook(audio, rate=24000)
 
         return synthesized_audio
 
@@ -945,11 +934,9 @@ class Vevo2InferencePipeline:
         speech, speech24k, speech16k = load_wav(wav_path, self.device)
         if display_audio:
             print("Ground Truth audio:")
-            display_audio_in_notebook(speech, rate=24000)
 
         mel = self.extract_mel_feature(speech24k)  # [1, T, D]
         audio = self.vocoder_model(mel.transpose(1, 2)).detach().cpu()[0]
         if display_audio:
             print("Resynthesized audio:")
-            display_audio_in_notebook(audio, rate=24000)
         return audio
