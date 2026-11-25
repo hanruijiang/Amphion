@@ -1,0 +1,16 @@
+# Runtime only; version baseline from teamup-tech/Vevo2.
+torch==2.8.0
+torchaudio==2.8.0
+torchvision==0.23.0
+transformers==4.57.6
+accelerate==1.14.0
+huggingface_hub>=0.34,<1.0
+safetensors
+numpy
+scipy
+einops==0.8.2
+librosa==0.11.0
+soundfile
+praat-parselmouth==0.4.7
+openai-whisper==20250625
+json5
