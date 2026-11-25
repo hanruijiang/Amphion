@@ -66,12 +66,11 @@ def extract_f0_hz(
     cfg.hop_size = hop_length
     cfg.f0_min = f0_min
     cfg.f0_max = f0_max
-    cfg.pitch_bin = 256
-    cfg.pitch_max = f0_max
-    cfg.pitch_min = f0_min
 
     # Compute f0
     audio, _ = librosa.load(wav_path, sr=fs)
+    if audio.size < int(0.1 * fs) or not np.isfinite(audio).all():
+        raise ValueError(f"Audio must be finite and at least 0.1 seconds: {wav_path}")
     f0 = get_f0_features_using_parselmouth(
         audio,
         cfg,

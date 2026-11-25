@@ -6,10 +6,7 @@
 import torch
 import numpy as np
 import torch.nn as nn
-import math
-from einops import rearrange
 from models.vc.flow_matching_transformer.llama_nar import DiffLlama
-import torch.nn.functional as F
 
 
 class FlowMatchingTransformer(nn.Module):
@@ -19,11 +16,8 @@ class FlowMatchingTransformer(nn.Module):
         hidden_size=1024,
         num_layers=12,
         num_heads=16,
-        cfg_scale=0.2,
         cond_codebook_size=1024,
         cond_scale_factor=1,
-        sigma=1e-5,
-        time_scheduler="linear",
         cfg=None,
     ):
         super().__init__()
@@ -34,20 +28,14 @@ class FlowMatchingTransformer(nn.Module):
             hidden_size = getattr(cfg, "hidden_size", hidden_size)
             num_layers = getattr(cfg, "num_layers", num_layers)
             num_heads = getattr(cfg, "num_heads", num_heads)
-            cfg_scale = getattr(cfg, "cfg_scale", cfg_scale)
             cond_codebook_size = getattr(cfg, "cond_codebook_size", cond_codebook_size)
-            time_scheduler = getattr(cfg, "time_scheduler", time_scheduler)
-            sigma = getattr(cfg, "sigma", sigma)
             cond_scale_factor = getattr(cfg, "cond_scale_factor", cond_scale_factor)
 
         self.mel_dim = mel_dim
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.num_heads = num_heads
-        self.cfg_scale = cfg_scale
         self.cond_codebook_size = cond_codebook_size
-        self.time_scheduler = time_scheduler
-        self.sigma = sigma
         self.cond_scale_factor = cond_scale_factor
 
         self.cond_emb = nn.Embedding(cond_codebook_size, self.hidden_size)
@@ -70,29 +58,15 @@ class FlowMatchingTransformer(nn.Module):
         else:
             self.do_resampling = False
 
-        ### REPA: Use the Wav2Vec2Bert features to align. ###
-        self.use_repa = "repa" in cfg
-        self.repa_layer_index = None
-        if self.use_repa:
-            self.repa_layer_index = cfg.repa.layer_index
-
+        # Retain the published checkpoint's training head parameters.
+        if cfg is not None and "repa" in cfg:
             self.repa_mlp_layer = nn.Sequential(
                 nn.Linear(hidden_size, hidden_size * 4),
                 nn.SiLU(),
                 nn.Linear(hidden_size * 4, cfg.repa.output_dim),
             )
-
-        ### CTC: Use the ASR loss ###
-        self.use_ctc = "ctc" in cfg
-        self.ctc_layer_index = None
-        if self.use_ctc:
-            self.ctc_layer_index = cfg.ctc.layer_index
-
-            self.ctc_mlp_layer = nn.Sequential(
-                nn.Linear(hidden_size, hidden_size * 4),
-                nn.SiLU(),
-                nn.Linear(hidden_size * 4, cfg.ctc.output_dim),
-            )
+        if cfg is not None and "ctc" in cfg:
+            raise ValueError("CTC-conditioned FM checkpoints are not supported.")
 
         self.reset_parameters()
 
@@ -103,106 +77,6 @@ class FlowMatchingTransformer(nn.Module):
             num_layers=num_layers,
         )
 
-        self.sigma = sigma
-
-    @torch.no_grad()
-    def forward_diffusion(self, x, t):
-        """
-        x: (B, T, mel_dim)
-        t: (B,)
-        """
-        new_t = t
-        t = t.unsqueeze(-1).unsqueeze(-1)
-        z = torch.randn(
-            x.shape, dtype=x.dtype, device=x.device, requires_grad=False
-        )  # (B, T, mel_dim)
-
-        cfg_scale = self.cfg_scale
-
-        # get prompt len
-        if torch.rand(1) > cfg_scale:
-            prompt_len = torch.randint(
-                min(x.shape[1] // 4, 5), int(x.shape[1] * 0.4), (x.shape[0],)
-            ).to(
-                x.device
-            )  # (B,)
-        else:
-            prompt_len = torch.zeros(x.shape[0]).to(x)  # (B,)
-
-        # get is prompt
-        is_prompt = torch.zeros_like(x[:, :, 0])  # (B, T)
-        col_indices = (
-            torch.arange(is_prompt.shape[1])
-            .repeat(is_prompt.shape[0], 1)
-            .to(prompt_len)
-        )  # (B, T)
-        is_prompt[col_indices < prompt_len.unsqueeze(1)] = 1  # (B, T) 1 if prompt
-
-        mask = torch.ones_like(x[:, :, 0])  # mask if 1, not mask if 0
-        mask[is_prompt.bool()] = 0
-        mask = mask[:, :, None]
-
-        # flow matching: xt = (1 - (1 - sigma) * t) * x0 + t * x; where x0 ~ N(0, 1), x is a sample
-        # flow gt: x - (1 - sigma) * x0 = x - (1 - sigma) * noise
-        xt = ((1 - (1 - self.sigma) * t) * z + t * x) * mask + x * (1 - mask)
-
-        return xt, z, new_t, prompt_len, mask
-
-    def loss_t(
-        self,
-        x,
-        x_mask,
-        t,
-        cond=None,
-    ):
-        xt, z, new_t, prompt_len, mask = self.forward_diffusion(x, t)
-
-        noise = z
-
-        # drop all condition for cfg, so if prompt_len is 0, we also drop cond
-        if cond is not None:
-            cond = cond * torch.where(
-                prompt_len > 0,
-                torch.ones_like(prompt_len),
-                torch.zeros_like(prompt_len),
-            ).to(cond.device).unsqueeze(-1).unsqueeze(-1)
-
-        dit_output = self.diff_estimator(xt, new_t, cond, x_mask, return_dict=True)
-        flow_pred = dit_output["output"]  # (B, T, mel_dim)
-
-        # final mask used for loss calculation
-        final_mask = mask * x_mask[..., None]  # (B, T, 1)
-
-        results = {"output": (noise, x, flow_pred, final_mask, prompt_len)}
-
-        if self.use_repa:
-            repa_hidden_states = dit_output["hidden_states"][
-                self.repa_layer_index
-            ]  # (B, T, hidden_size)
-
-            repa_pred = self.repa_mlp_layer(repa_hidden_states)  # (B, T, repa_dim)
-            results["repa"] = repa_pred
-
-        if self.use_ctc:
-            ctc_hidden_states = dit_output["hidden_states"][
-                self.ctc_layer_index
-            ]  # (B, T, hidden_size)
-            ctc_pred = self.ctc_mlp_layer(ctc_hidden_states)  # (B, T, ctc_dim)
-            results["ctc"] = ctc_pred
-
-        return results
-
-    def compute_loss(self, x, x_mask, cond=None):
-        # x0: (B, T, num_quantizer)
-        # x_mask: (B, T) mask is 0 for padding
-        t = torch.rand(x.shape[0], device=x.device, requires_grad=False)
-        t = torch.clamp(t, 1e-5, 1.0)
-        # from CosyVoice: considering the generation process at the beginning is harder than follows, we involve a cosine scheduler for the timestep t
-        if self.time_scheduler == "cos":
-            t = 1 - torch.cos(t * math.pi * 0.5)
-        else:
-            pass
-        return self.loss_t(x, x_mask, t, cond)
 
     def reset_parameters(self):
         def _reset_parameters(m):
@@ -249,18 +123,21 @@ class FlowMatchingTransformer(nn.Module):
         prompt,
         x_mask=None,
         prompt_mask=None,
-        text_embedding=None,
         n_timesteps=10,
         cfg=1.0,
         rescale_cfg=0.75,
     ):
+        if n_timesteps < 1:
+            raise ValueError("Flow matching steps must be positive")
         h = 1.0 / n_timesteps
         prompt_len = prompt.shape[1]
         target_len = cond.shape[1] - prompt_len
+        if target_len <= 0:
+            raise ValueError("No target frames remain after the timbre prompt")
 
-        if x_mask == None:
+        if x_mask is None:
             x_mask = torch.ones(cond.shape[0], target_len).to(cond.device)  # (B, T)
-        if prompt_mask == None:
+        if prompt_mask is None:
             prompt_mask = torch.ones(cond.shape[0], prompt_len).to(
                 cond.device
             )  # (B, prompt_len)
@@ -289,8 +166,11 @@ class FlowMatchingTransformer(nn.Module):
                 )
                 pos_flow_pred_std = flow_pred.std()
                 flow_pred_cfg = flow_pred + cfg * (flow_pred - uncond_flow_pred)
+                cfg_std = flow_pred_cfg.std()
                 rescale_flow_pred = (
-                    flow_pred_cfg * pos_flow_pred_std / flow_pred_cfg.std()
+                    flow_pred_cfg * pos_flow_pred_std / cfg_std
+                    if torch.isfinite(cfg_std) and cfg_std > 0
+                    else flow_pred_cfg
                 )
                 flow_pred = (
                     rescale_cfg * rescale_flow_pred + (1 - rescale_cfg) * flow_pred_cfg
@@ -300,29 +180,3 @@ class FlowMatchingTransformer(nn.Module):
             xt = xt + dxt
 
         return xt
-
-    def forward(self, x, x_mask, cond_code):
-        """
-        Args:
-            x: (B, T, mel_dim)
-            x_mask: (B, T)
-            cond_code: (B, T), Note that cond_code might be not at 50Hz!
-        """
-        T = x.shape[1]
-
-        cond = self.cond_emb(cond_code)  # (B, T, hidden_size)
-        if self.do_resampling:
-            # Align to the frame rate of Mels
-            cond = self.resampling_layers(cond.transpose(1, 2)).transpose(1, 2)
-
-        # print("cond_code: {}, after resampling: {}".format(cond_code.shape, cond.shape))
-
-        if cond.shape[1] >= T:  # Check time dimension
-            cond = cond[:, :T, :]
-        else:
-            padding_frames = T - cond.shape[1]
-            last_frame = cond[:, -1:, :]
-            padding = last_frame.repeat(1, padding_frames, 1)
-            cond = torch.cat([cond, padding], dim=1)
-
-        return self.compute_loss(x, x_mask, cond)

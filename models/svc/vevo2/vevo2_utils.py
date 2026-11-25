@@ -1,5 +1,4 @@
 import math
-import json
 import librosa
 import torch
 import torchaudio
@@ -7,14 +6,13 @@ import soundfile as sf
 import accelerate
 import numpy as np
 import os
+import warnings
 
-import torchvision
-import random
 import whisper
 from librosa.feature import chroma_stft
 from librosa.effects import pitch_shift
 
-from models.codec.coco.rep_coco_model import CocoContentStyle, CocoContent, CocoStyle
+from models.codec.coco.rep_coco_model import CocoContentStyle, CocoStyle
 from models.svc.flow_matching_transformer.fmt_model import FlowMatchingTransformer
 from models.codec.melvqgan.melspec import MelSpectrogram
 from models.codec.amphion_codec.vocos import Vocos
@@ -27,34 +25,13 @@ from models.svc.vevo2.pitch import extract_f0_hz
 
 from transformers.utils import is_flash_attn_2_available
 
-supported_flash_attn = False
-if not torch.cuda.is_available():
-    print("No CUDA available")
-    supported_flash_attn = False
-
-# To check if flash attention is supported
-if is_flash_attn_2_available():
-    supported_flash_attn = True
-    print("Flash Attention is supported")
-else:
-    print("Flash Attention is not supported")
-
-
 # Coco Tokenizer
-def build_coco_model(coco_cfg, device, loading_decoder=False):
+def build_coco_model(coco_cfg, device):
     coco_model_type = getattr(coco_cfg, "coco_type", "content_style")
     if coco_model_type == "content_style":
-        model = CocoContentStyle(
-            cfg=coco_cfg, construct_only_for_quantizer=not loading_decoder
-        )
-    elif coco_model_type == "content":
-        model = CocoContent(
-            cfg=coco_cfg, construct_only_for_quantizer=not loading_decoder
-        )
+        model = CocoContentStyle(cfg=coco_cfg)
     elif coco_model_type == "style":
-        model = CocoStyle(
-            cfg=coco_cfg, construct_only_for_quantizer=not loading_decoder
-        )
+        model = CocoStyle(cfg=coco_cfg)
     else:
         raise ValueError(f"Unknown coco type: {coco_model_type}")
 
@@ -76,16 +53,16 @@ def build_ar_model(ckpt_path, device):
     model_kwargs = {
         "device_map": device,
         "torch_dtype": "auto",
-        "trust_remote_code": True,
     }
 
-    # Only add flash attention parameter if supported
-    if supported_flash_attn:
+    if (
+        device.type == "cuda"
+        and is_flash_attn_2_available()
+        and torch.cuda.get_device_capability(device)[0] >= 8
+        and torch.cuda.is_bf16_supported()
+    ):
         model_kwargs["attn_implementation"] = "flash_attention_2"
 
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     cfg.model.pretrained_model_path, **model_kwargs
-    # )
     model = AutoModelForCausalLM.from_pretrained(ckpt_path, **model_kwargs)
 
     model.eval()
@@ -139,6 +116,10 @@ def load_wav(wav_path, device, used_duration=None):
         speech16k = torch.zeros(1, 0).to(device)  # [1, T']
     else:
         speech = librosa.load(wav_path, sr=24000)[0]  # [T]
+        if speech.size == 0 or not np.isfinite(speech).all():
+            raise ValueError(f"Empty or non-finite audio: {wav_path}")
+        if speech.size < 2400:
+            raise ValueError(f"Audio must be at least 0.1 seconds: {wav_path}")
 
         if used_duration is not None:
             speech = speech[: int(used_duration * 24000)]
@@ -165,6 +146,8 @@ def save_audio(
     else:
         target_sample_rate = sr
 
+    if waveform.numel() == 0 or not torch.isfinite(waveform).all():
+        raise RuntimeError("Inference produced empty or non-finite audio")
     rms = torch.sqrt(torch.mean(waveform**2))
     current_db = 20 * torch.log10(rms + 1e-9)
 
@@ -217,10 +200,8 @@ class Vevo2InferencePipeline:
         vocoder_cfg_path=None,
         vocoder_ckpt_path=None,
         device=None,
-        use_vllm=False,
     ):
         self.device = device
-        self.use_vllm = use_vllm
 
         self.prosody_tokenizer_ckpt_path = prosody_tokenizer_ckpt_path
         self.content_style_tokenizer_ckpt_path = content_style_tokenizer_ckpt_path
@@ -228,21 +209,8 @@ class Vevo2InferencePipeline:
         if ar_cfg_path is not None and ar_ckpt_path is not None:
             self.ar_cfg = load_config(ar_cfg_path)
 
-            assert not use_vllm, "VLLM is not supported yet"
-
-            if use_vllm:
-                pass
-            else:
-                # self.ar_model = load_checkpoint(
-                #     build_ar_model, self.ar_cfg, ar_ckpt_path, device
-                # )
-
-                self.ar_model = build_ar_model(ar_ckpt_path, device)
-                print(f"#Params of AR model: {count_parameters(self.ar_model)}")
-
-            # self.ar_tokenizer = AutoTokenizer.from_pretrained(
-            #     self.ar_cfg.preprocess.tokenizer_path, local_files_only=True
-            # )
+            self.ar_model = build_ar_model(ar_ckpt_path, device)
+            print(f"#Params of AR model: {count_parameters(self.ar_model)}")
             self.ar_tokenizer = AutoTokenizer.from_pretrained(
                 ar_ckpt_path, local_files_only=True
             )
@@ -252,6 +220,8 @@ class Vevo2InferencePipeline:
 
         if fmt_cfg_path is not None and fmt_ckpt_path is not None:
             self.fmt_cfg = load_config(fmt_cfg_path)
+            if getattr(self.fmt_cfg.model.flow_matching_transformer, "use_text_as_condition", False):
+                raise ValueError("Text-conditioned FM checkpoints are not supported.")
             # The published config refers to the removed VevoSing source tree.
             self.fmt_cfg.model.coco.whisper_stats_path = os.path.join(
                 os.path.dirname(fmt_cfg_path), "whisper_stats.pt"
@@ -260,18 +230,6 @@ class Vevo2InferencePipeline:
                 build_fmt_model, self.fmt_cfg, fmt_ckpt_path, device
             )
             print(f"#Params of Flow Matching model: {count_parameters(self.fmt_model)}")
-
-            if getattr(
-                self.fmt_cfg.model.flow_matching_transformer,
-                "use_text_as_condition",
-                False,
-            ):
-                self.fmt_use_text_as_condition = True
-                self.fmt_text_tokenizer = AutoTokenizer.from_pretrained(
-                    self.fmt_cfg.preprocess.tokenizer_path
-                )
-            else:
-                self.fmt_use_text_as_condition = False
 
             self.init_coco_tokenizer()
 
@@ -300,7 +258,7 @@ class Vevo2InferencePipeline:
             self.whisper_std = whisper_stats["std"]  # (1024,)
 
         ## Prosody Tokenizer ##
-        if self.ar_model is not None:
+        if self.prosody_tokenizer_ckpt_path is not None:
             self.style_tokenizer = load_checkpoint(
                 build_coco_model,
                 self.ar_cfg.model.coco_style,
@@ -331,22 +289,8 @@ class Vevo2InferencePipeline:
         )
         return mel_feature
 
-    def spec_augment(self, mel, height):
-        """
-        Args:
-            mel: tensor (..., n_mels, frames)
-            height: int 68-92 for default 80 mels
-        """
-        tgt = torchvision.transforms.functional.resize(mel, (height, mel.shape[-1]))
-        if height >= mel.shape[-2]:
-            return tgt[:, : mel.shape[-2], :]
-        else:
-            silence = tgt[:, -1:, :].repeat(1, mel.shape[-2] - height, 1)
-            silence += torch.randn_like(silence) / 10
-            return torch.cat((tgt, silence), 1)
-
     @torch.no_grad()
-    def extract_whisper_features(self, wavs, frame_lens, spec_perturb=False):
+    def extract_whisper_features(self, wavs, frame_lens):
         """
         Args:
             wavs: (B, T) at 16khz. Note that the max duration should be 30s
@@ -355,13 +299,11 @@ class Vevo2InferencePipeline:
             features: (B, T, D)
         """
         # wavs: (batch, max_len)
+        if wavs.shape[-1] > 30 * 16000:
+            raise ValueError("Whisper feature extraction supports at most 30 seconds of audio; trim the input.")
         wavs = whisper.pad_or_trim(wavs)
         # batch_mel: (batch, 80, 3000)
         batch_mel = whisper.log_mel_spectrogram(wavs, device=self.device)
-
-        if spec_perturb:
-            height = random.randint(68, 92)
-            batch_mel = self.spec_augment(batch_mel, height)
 
         with torch.no_grad():
             # (batch, 1500, 1024)
@@ -392,15 +334,13 @@ class Vevo2InferencePipeline:
         coco_codec_type,
         wav16k,
         wav24k_numpy,
-        whisper_spec_perturb=False,
         frame_len_ratio=1.0,
         use_shifted_wav_to_extract_chromagram=False,
-        use_shifted_wav_to_extract_whisper=False,
         pitch_shift_steps=0,
     ):
         """
         Args:
-            coco_codec_type: "content", "style", or "content_style"
+            coco_codec_type: "style" or "content_style"
             wav16k: [1, T]
             wav24k_numpy: [T]
         Returns:
@@ -440,17 +380,10 @@ class Vevo2InferencePipeline:
                 f"Chromagram feats are sampled from {raw_len} to {chromagram_feats.shape[1]}, ratio = {frame_len_ratio}"
             )
 
-        if use_shifted_wav_to_extract_whisper:
-            wav16k = pitch_shift(
-                wav16k.cpu().numpy()[0], sr=16000, n_steps=pitch_shift_steps
-            )  # [T]
-            wav16k = torch.tensor(wav16k).unsqueeze(0).to(self.device)  # [1, T]
-
-        if coco_codec_type in ["content_style", "content"]:
+        if coco_codec_type == "content_style":
             whisper_feats = self.extract_whisper_features(
                 wav16k,
                 torch.tensor([frame_len], dtype=torch.long).to(self.device),
-                spec_perturb=whisper_spec_perturb,
             )  # [1, T, D]
 
         if coco_codec_type == "content_style":
@@ -477,9 +410,11 @@ class Vevo2InferencePipeline:
             n_chroma=24,
         ).T
 
+        if chromagram.shape[0] == 0 or speech_frames <= 0:
+            raise ValueError("Audio is too short for chromagram extraction")
         if chromagram.shape[0] < speech_frames:
             chromagram = np.pad(
-                chromagram, (0, speech_frames - chromagram.shape[0]), mode="edge"
+                chromagram, ((0, speech_frames - chromagram.shape[0]), (0, 0)), mode="edge"
             )
         else:
             chromagram = chromagram[:speech_frames]
@@ -493,8 +428,19 @@ class Vevo2InferencePipeline:
         src_f0 = extract_f0_hz(src_wav_path)
         timbre_ref_f0 = extract_f0_hz(timbre_ref_wav_path)
 
+        if src_f0.size == 0 or timbre_ref_f0.size == 0:
+            warnings.warn("No F0 frames; skipping pitch shift", RuntimeWarning)
+            return 0
         src_f0_median = np.median(src_f0)
         timbre_ref_f0_median = np.median(timbre_ref_f0)
+        if (
+            not np.isfinite(src_f0_median)
+            or not np.isfinite(timbre_ref_f0_median)
+            or src_f0_median <= 0
+            or timbre_ref_f0_median <= 0
+        ):
+            warnings.warn("No valid F0; skipping pitch shift", RuntimeWarning)
+            return 0
 
         src_shifted_steps = 12 * np.log2(timbre_ref_f0_median / src_f0_median)
         src_shifted_steps = round(src_shifted_steps)
@@ -511,9 +457,6 @@ class Vevo2InferencePipeline:
         self,
         src_wav_path,
         timbre_ref_wav_path,
-        src_wav_text="",
-        timbre_ref_wav_text="",
-        whisper_spec_perturb=False,
         use_pitch_shift=False,
         used_duration_of_timbre_ref_wav_path=None,
         flow_matching_steps=32,
@@ -545,7 +488,6 @@ class Vevo2InferencePipeline:
             "content_style",
             src_speech16k,
             src_speech,
-            whisper_spec_perturb=whisper_spec_perturb,
             use_shifted_wav_to_extract_chromagram=use_pitch_shift,
             pitch_shift_steps=src_shifted_steps,
         )  # [1, T]
@@ -553,7 +495,6 @@ class Vevo2InferencePipeline:
         predict_mel_feat = self.code2mel(
             src_codecs,
             timbre_ref_wav_path,
-            prefix_text=timbre_ref_wav_text + " " + src_wav_text,
             used_duration_of_timbre_ref_wav_path=used_duration_of_timbre_ref_wav_path,
             flow_matching_steps=flow_matching_steps,
             logging=display_audio,
@@ -573,16 +514,14 @@ class Vevo2InferencePipeline:
             follow_prosody_instruction=follow_prosody_instruction,
         )
 
-        # if logging:
-        #     print("-" * 20)
-        #     print("LLM Prompt Text:\n{}".format(llm_prompt_text))
+
+
 
         return llm_prompt_text
 
     def get_llm_prompt_prosody(
         self,
         use_prosody_code,
-        predict_target_prosody,
         prosody_wav_path=None,
         style_ref_wav_path=None,
         use_pitch_shift=False,
@@ -594,60 +533,57 @@ class Vevo2InferencePipeline:
         if not use_prosody_code:
             return ""
 
-        if not predict_target_prosody:
-            # Just use the ground truth prosody #
+        # Just use the ground truth prosody #
 
-            assert prosody_wav_path is not None
-            prosody_speech, prosody_speech24k, prosody_speech16k = load_wav(
-                prosody_wav_path, self.device
+        assert prosody_wav_path is not None
+        prosody_speech, prosody_speech24k, prosody_speech16k = load_wav(
+            prosody_wav_path, self.device
+        )
+
+        if target_duration is not None:
+            # Calculate the chromagram frame len ratio
+            prosody_wav_duration = prosody_speech.shape[0] / 24000
+            prosody_wav_chromagram_frame_len_ratio = (
+                target_duration / prosody_wav_duration
             )
-
-            if target_duration is not None:
-                # Calculate the chromagram frame len ratio
-                prosody_wav_duration = prosody_speech.shape[0] / 24000
-                prosody_wav_chromagram_frame_len_ratio = (
-                    target_duration / prosody_wav_duration
-                )
-            else:
-                prosody_wav_chromagram_frame_len_ratio = 1.0
-
-            prosody_wav_prosody_ids = self.extract_coco_codec(
-                "style",
-                prosody_speech16k,
-                prosody_speech,
-                frame_len_ratio=prosody_wav_chromagram_frame_len_ratio,
-                use_shifted_wav_to_extract_chromagram=use_pitch_shift,
-                pitch_shift_steps=prosody_wav_pitch_shift_steps,
-            )  # [1, T]
-
-            if style_ref_wav_path is not None:
-                style_ref_speech, style_ref_speech24k, style_ref_speech16k = load_wav(
-                    style_ref_wav_path, self.device
-                )
-                style_ref_wav_prosody_ids = self.extract_coco_codec(
-                    "style",
-                    style_ref_speech16k,
-                    style_ref_speech,
-                    use_shifted_wav_to_extract_chromagram=use_pitch_shift,
-                    pitch_shift_steps=style_ref_wav_pitch_shift_steps,
-                )  # [1, T]
-            else:
-                style_ref_wav_prosody_ids = torch.zeros(1, 0).to(self.device)
-
-            prosody_ids = torch.cat(
-                [style_ref_wav_prosody_ids, prosody_wav_prosody_ids], dim=1
-            )  # [1, T]
-
-            prosody_ids = prosody_ids[0].tolist()
-            prosody_text = "".join(["<|prosody_{}|>".format(i) for i in prosody_ids])
-            prosody_text = "<|prosody_start|>" + prosody_text + "<|prosody_end|>"
-
-            if logging:
-                print("-" * 20)
-                print("Prosody (Melody) Audio: ", prosody_wav_path)
-
         else:
-            raise NotImplementedError("Not implemented yet")
+            prosody_wav_chromagram_frame_len_ratio = 1.0
+
+        prosody_wav_prosody_ids = self.extract_coco_codec(
+            "style",
+            prosody_speech16k,
+            prosody_speech,
+            frame_len_ratio=prosody_wav_chromagram_frame_len_ratio,
+            use_shifted_wav_to_extract_chromagram=use_pitch_shift,
+            pitch_shift_steps=prosody_wav_pitch_shift_steps,
+        )  # [1, T]
+
+        if style_ref_wav_path is not None:
+            style_ref_speech, style_ref_speech24k, style_ref_speech16k = load_wav(
+                style_ref_wav_path, self.device
+            )
+            style_ref_wav_prosody_ids = self.extract_coco_codec(
+                "style",
+                style_ref_speech16k,
+                style_ref_speech,
+                use_shifted_wav_to_extract_chromagram=use_pitch_shift,
+                pitch_shift_steps=style_ref_wav_pitch_shift_steps,
+            )  # [1, T]
+        else:
+            style_ref_wav_prosody_ids = torch.zeros(1, 0).to(self.device)
+
+        prosody_ids = torch.cat(
+            [style_ref_wav_prosody_ids, prosody_wav_prosody_ids], dim=1
+        )  # [1, T]
+
+        prosody_ids = prosody_ids[0].tolist()
+        prosody_text = "".join(["<|prosody_{}|>".format(i) for i in prosody_ids])
+        prosody_text = "<|prosody_start|>" + prosody_text + "<|prosody_end|>"
+
+        if logging:
+            print("-" * 20)
+            print("Prosody (Melody) Audio: ", prosody_wav_path)
+
 
         return prosody_text
 
@@ -700,6 +636,8 @@ class Vevo2InferencePipeline:
         )
 
         content_style_ids = extract_special_ids(generated_text, prefix="content_style")
+        if not content_style_ids:
+            raise RuntimeError("AR model generated no content-style tokens")
         content_style_ids = (
             torch.tensor(content_style_ids, dtype=torch.long)
             .to(self.device)
@@ -718,7 +656,6 @@ class Vevo2InferencePipeline:
         self,
         contentstyle_codecs,
         timbre_ref_wav_path,
-        prefix_text="",
         used_duration_of_timbre_ref_wav_path=None,
         flow_matching_steps=32,
         logging=False,
@@ -752,26 +689,10 @@ class Vevo2InferencePipeline:
 
         timbre_ref_mels = self.extract_mel_feature(timbre_ref_speech24k)  # [1, T, D]
 
-        # Text as condition
-        if self.fmt_use_text_as_condition:
-            prefix_text_ids = self.fmt_text_tokenizer.encode(
-                prefix_text, add_special_tokens=False
-            )
-            prefix_text_ids = torch.tensor(prefix_text_ids, dtype=torch.long).to(
-                self.device
-            )  # [T]
-            prefix_text_ids = prefix_text_ids.unsqueeze(0)  # [1, T]
-            prefix_text_embedding = self.fmt_model.text_cond_emb(
-                prefix_text_ids
-            )  # [1, T, D]
-        else:
-            prefix_text_embedding = None
-
         # [1, T, D]
         predict_mel_feat = self.fmt_model.reverse_diffusion(
             cond=diffusion_cond,
             prompt=timbre_ref_mels,
-            text_embedding=prefix_text_embedding,
             n_timesteps=flow_matching_steps,
         )
         return predict_mel_feat
@@ -798,7 +719,6 @@ class Vevo2InferencePipeline:
         style_ref_wav_text="",
         timbre_ref_wav_path=None,
         use_prosody_code=True,
-        predict_target_prosody=False,
         top_k=25,
         top_p=0.8,
         temperature=1.0,
@@ -816,7 +736,7 @@ class Vevo2InferencePipeline:
         """
         assert self.ar_model is not None
         assert target_text is not None
-        # assert style_ref_wav_path is not None
+
         assert timbre_ref_wav_path is not None
 
         ## Text Tokens ##
@@ -848,7 +768,6 @@ class Vevo2InferencePipeline:
         ## Prosody Tokens ##
         llm_prompt_prosody = self.get_llm_prompt_prosody(
             use_prosody_code,
-            predict_target_prosody,
             prosody_wav_path=prosody_wav_path,
             style_ref_wav_path=style_ref_wav_path,
             use_pitch_shift=use_pitch_shift,
@@ -873,46 +792,20 @@ class Vevo2InferencePipeline:
             torch.tensor(llm_input_ids, dtype=torch.long).to(self.device).unsqueeze(0)
         )  # [1, T]
 
-        if self.use_vllm:
-            sampling_params = SamplingParams(
-                max_tokens=500,
-                top_k=top_k,
-                top_p=top_p,
-                temperature=temperature,
-                stop_token_ids=[self.ar_tokenizer.eos_token_id],
-                skip_special_tokens=False,
-            )
-            outputs = self.ar_model.generate([llm_prompt], sampling_params)
+        generate_ids = self.ar_model.generate(
+            input_ids=llm_input_ids,
+            min_new_tokens=15,
+            max_new_tokens=500,
+            eos_token_id=self.ar_tokenizer.eos_token_id,
+            do_sample=True,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+        )  # [1, T]
 
-            assert len(outputs) == 1
-            output = outputs[0]
-            prompt = output.prompt
-            predicted_coco_text = output.outputs[0].text
-            # print("vllm predicted_coco_text: ", predicted_coco_text)
-
-            predicted_coco_codecs = extract_special_ids(
-                predicted_coco_text, prefix="content_style"
-            )
-            predicted_coco_codecs = (
-                torch.tensor(predicted_coco_codecs, dtype=torch.long)
-                .to(self.device)
-                .unsqueeze(0)
-            )  # [1, T]
-        else:
-            generate_ids = self.ar_model.generate(
-                input_ids=llm_input_ids,
-                min_new_tokens=15,
-                max_new_tokens=500,
-                eos_token_id=self.ar_tokenizer.eos_token_id,
-                do_sample=True,
-                top_k=top_k,
-                top_p=top_p,
-                temperature=temperature,
-            )  # [1, T]
-
-            predicted_coco_codecs = self.parse_llm_generated_ids(
-                generate_ids, llm_input_ids, logging=display_audio
-            )  # [1, T]
+        predicted_coco_codecs = self.parse_llm_generated_ids(
+            generate_ids, llm_input_ids, logging=display_audio
+        )  # [1, T]
 
         ## Diffusion ##
         predict_mel_feat = self.code2mel(
@@ -928,15 +821,3 @@ class Vevo2InferencePipeline:
             predict_mel_feat, logging=display_audio
         )  # [1, T]
         return synthesized_audio
-
-    @torch.no_grad()
-    def inference_vocoder_resynthesis(self, wav_path, display_audio=False):
-        speech, speech24k, speech16k = load_wav(wav_path, self.device)
-        if display_audio:
-            print("Ground Truth audio:")
-
-        mel = self.extract_mel_feature(speech24k)  # [1, T, D]
-        audio = self.vocoder_model(mel.transpose(1, 2)).detach().cpu()[0]
-        if display_audio:
-            print("Resynthesized audio:")
-        return audio

@@ -29,8 +29,11 @@ def load_pipeline(args):
         "vocoder/model.safetensors",
     ]
     use_ar = args.task != "convert"
+    use_prosody = args.task in ("edit", "style", "melody")
     if use_ar:
-        paths += [PROSODY_DIR + "/model.safetensors", AR_DIR + "/*"]
+        paths += [AR_DIR + "/*"]
+    if use_prosody:
+        paths += [PROSODY_DIR + "/model.safetensors"]
     local = Path(snapshot_download(
         repo_id=MODEL_REPO, revision=MODEL_REVISION,
         local_dir=str(args.ckpt_dir), local_files_only=args.local_files_only,
@@ -41,7 +44,7 @@ def load_pipeline(args):
     )).resolve()
     return Vevo2InferencePipeline(
         content_style_tokenizer_ckpt_path=str(local / CONTENT_DIR),
-        prosody_tokenizer_ckpt_path=str(local / PROSODY_DIR) if use_ar else None,
+        prosody_tokenizer_ckpt_path=str(local / PROSODY_DIR) if use_prosody else None,
         ar_cfg_path=str(local / AR_DIR / "amphion_config.json") if use_ar else None,
         ar_ckpt_path=str(local / AR_DIR) if use_ar else None,
         fmt_cfg_path=str(local / FM_DIR / "config.json"),

@@ -1,7 +1,3 @@
-import re
-import torch
-
-
 def format_chat_prompt(messages, add_assistant_token):
     """
     Convert the messages list into the Qwen chat template format.
@@ -54,52 +50,3 @@ def gen_chat_prompt(text, add_assistant_token, follow_prosody_instruction):
         },
     ]
     return format_chat_prompt(template, add_assistant_token)
-
-
-def gen_chat_response(prosody_ids, content_style_ids, is_full_response=True):
-    """
-    Args:
-        prosody_ids (list): The prosody ids of the text.
-        content_style_ids (list): The content style ids of the text.
-    """
-    if prosody_ids is not None:
-        prosody_text = "".join(["<|prosody_{}|>".format(int(i)) for i in prosody_ids])
-        prosody_text = "<|prosody_start|>" + prosody_text + "<|prosody_end|>"
-    else:
-        prosody_text = ""
-
-    if content_style_ids is not None:
-        content_style_text = "".join(
-            ["<|content_style_{}|>".format(int(i)) for i in content_style_ids]
-        )
-    else:
-        content_style_text = ""
-
-    if is_full_response:
-        return (
-            prosody_text
-            + "<|content_style_start|>"
-            + content_style_text
-            + "<|content_style_end|>"
-            + "<|im_end|>"
-        )
-    else:
-        return prosody_text + "<|content_style_start|>" + content_style_text
-
-
-def extract_content_style_ids(text):
-    """
-    Extract the content_style IDs from the text
-
-    Args:
-        text (str): A string containing content_style tags
-
-    Returns:
-        torch.Tensor: [T]
-    """
-    # Use regex to match all <|content_style_数字|> patterns
-    pattern = r"<\|content_style_(\d+)\|>"
-    # Find all matches and extract the numeric part
-    matches = re.findall(pattern, text)
-    # Convert string numbers to integers
-    return torch.tensor([int(match) for match in matches], dtype=torch.long)

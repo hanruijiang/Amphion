@@ -7,7 +7,7 @@ A minimal inference-only fork of [Amphion](https://github.com/open-mmlab/Amphion
 Use Python 3.11 (the reference Space's version), FFmpeg on PATH and a CUDA-capable GPU for practical inference. Install matching PyTorch wheels for your platform if needed (see https://pytorch.org/get-started/locally/).
 
 ```bash
-git clone https://github.com/hanruijiang/Amphion.git
+git clone --branch vevo2-cli-only --single-branch https://github.com/hanruijiang/Amphion.git
 cd Amphion
 python -m venv .venv
 source .venv/bin/activate
@@ -17,7 +17,7 @@ python -m models.svc.vevo2 --help
 
 ## Inference
 
-Use your own audio files. Output is mono 24 kHz WAV. The first run downloads the required weights from [RMSnow/Vevo2](https://huggingface.co/RMSnow/Vevo2) at the pinned revision and Whisper medium weights; allow several GB of storage. FM-only conversion does not download the AR model or prosody tokenizer. The other tasks load AR + FM.
+Use your own audio files. Output is mono 24 kHz WAV. The first run downloads the required weights from [RMSnow/Vevo2](https://huggingface.co/RMSnow/Vevo2) at the pinned revision and Whisper medium weights; allow several GB of storage. FM-only conversion does not download the AR model or prosody tokenizer. TTS loads AR + FM without the prosody tokenizer; edit, style and melody also load the prosody tokenizer.
 
 ```bash
 # Voice / singing conversion (FM)
@@ -36,7 +36,7 @@ python -m models.svc.vevo2 style --input source.wav --reference style.wav --refe
 python -m models.svc.vevo2 melody --input melody.wav --reference voice.wav --reference-text "Reference lyrics" --text "Target lyrics" --output output/melody.wav
 ```
 
-Each task supports `--device auto|cuda|cpu`, `--steps 32`, `--ckpt-dir ckpts/Vevo2`, `--local-files-only`, and `--no-pitch-shift`. Use `--help` after the task for its options. CPU inference may be very slow. `--local-files-only` applies to Vevo2 weights; cache Whisper medium separately before running without a network. For TTS and melody, `--timbre-reference` optionally specifies a separate voice. Provide accurate reference transcripts when available.
+Each task supports `--device auto|cuda|cpu`, `--steps 32`, `--ckpt-dir ckpts/Vevo2`, `--local-files-only`, and `--no-pitch-shift`. Use `--help` after the task for its options. CPU inference may be very slow. `--local-files-only` applies to Vevo2 weights; cache Whisper medium separately before running without a network. For TTS and melody, `--timbre-reference` optionally specifies a separate voice. Provide accurate reference transcripts when available. Audio must be finite and at least 0.1 seconds long; inputs used for Whisper features must not exceed 30 seconds. AR generation is capped at 500 new tokens. Trim longer audio before inference.
 
 The original module names remain as CLI wrappers:
 ```bash
