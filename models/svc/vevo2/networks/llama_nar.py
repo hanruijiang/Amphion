@@ -16,11 +16,6 @@ from transformers.models.llama.modeling_llama import (
     LlamaRotaryEmbedding,
 )
 
-import logging
-
-logger = logging.getLogger(__name__)
-
-
 # sinusoidal positional encoding
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -58,20 +53,13 @@ class LlamaAdaptiveRMSNorm(nn.Module):
         return (weight * hidden_states).to(input_dtype)
 
 
-class OldLlamaAttention(nn.Module):
+class LlamaNARAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        if layer_idx is None:
-            logger.warning_once(
-                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
-                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
-            )
-
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -80,7 +68,6 @@ class OldLlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
-        self.is_causal = True
 
         self.q_proj = nn.Linear(
             self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias
@@ -99,7 +86,6 @@ class OldLlamaAttention(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias
         )
 
-        # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
 
     def forward(self, hidden_states, attention_mask, position_ids):
@@ -137,8 +123,7 @@ class LlamaNARDecoderLayer(LlamaDecoderLayer):
             config.hidden_size, eps=config.rms_norm_eps, dim_cond=config.hidden_size
         )
 
-        # For transformers v4.46 (added by Xueyao)
-        self.self_attn = OldLlamaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = LlamaNARAttention(config=config, layer_idx=layer_idx)
 
     def forward(self, hidden_states, cond_embedding, attention_mask, position_ids):
         residual = hidden_states
@@ -158,9 +143,6 @@ class DiffLlama(LlamaModel):
         hidden_size=1024,
         num_heads=16,
         num_layers=16,
-        dropout=0.1,
-        ffn_dropout=0.1,
-        attention_dropout=0.0,
         config=LlamaConfig(0, 256, 1024, 1, 1),
     ):
         super().__init__(config)
@@ -207,19 +189,9 @@ class DiffLlama(LlamaModel):
             nn.Linear(hidden_size * 4, mel_dim),
         )
 
-        for layer in self.layers:
-            layer.input_layernorm = LlamaAdaptiveRMSNorm(
-                hidden_size, dim_cond=hidden_size
-            )
-            layer.post_attention_layernorm = LlamaAdaptiveRMSNorm(
-                hidden_size, dim_cond=hidden_size
-            )
-
         self.embed_tokens = None
 
         self.post_init()
-
-        # self.reset_parameters()
 
     def _prepare_decoder_attention_mask(
         self, attention_mask, input_shape, inputs_embeds, past_key_values_length

@@ -3,5 +3,4 @@ __pycache__/
 .venv/
 ckpts/
 output/
-models/svc/vevo2/output/
 .pytest_cache/

@@ -21,16 +21,15 @@ class ISTFT(nn.Module):
         n_fft (int): Size of Fourier transform.
         hop_length (int): The distance between neighboring sliding window frames.
         win_length (int): The size of window frame and STFT filter.
-        padding (str, optional): Type of padding. Options are "center" or "same". Defaults to "same".
+        padding (str, optional): Type of padding. Uses "same" padding.
     """
 
     def __init__(
         self, n_fft: int, hop_length: int, win_length: int, padding: str = "same"
     ):
         super().__init__()
-        if padding not in ["center", "same"]:
-            raise ValueError("Padding must be 'center' or 'same'.")
-        self.padding = padding
+        if padding != "same":
+            raise ValueError("Vocos requires same padding")
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.win_length = win_length
@@ -48,20 +47,7 @@ class ISTFT(nn.Module):
         Returns:
             Tensor: Reconstructed time-domain signal of shape (B, L), where L is the length of the output signal.
         """
-        if self.padding == "center":
-            # Fallback to pytorch native implementation
-            return torch.istft(
-                spec,
-                self.n_fft,
-                self.hop_length,
-                self.win_length,
-                self.window,
-                center=True,
-            )
-        elif self.padding == "same":
-            pad = (self.win_length - self.hop_length) // 2
-        else:
-            raise ValueError("Padding must be 'center' or 'same'.")
+        pad = (self.win_length - self.hop_length) // 2
 
         assert spec.dim() == 3, "Expected a 3D tensor as input"
         B, N, T = spec.shape
@@ -95,22 +81,7 @@ class ISTFT(nn.Module):
         return y
 
 
-class FourierHead(nn.Module):
-    """Base class for inverse fourier modules."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x (Tensor): Input tensor of shape (B, L, H), where B is the batch size,
-                        L is the sequence length, and H denotes the model dimension.
-
-        Returns:
-            Tensor: Reconstructed time-domain audio signal of shape (B, T), where T is the length of the output signal.
-        """
-        raise NotImplementedError("Subclasses must implement the forward method.")
-
-
-class ISTFTHead(FourierHead):
+class ISTFTHead(nn.Module):
     """
     ISTFT Head module for predicting STFT complex coefficients.
 
@@ -119,7 +90,7 @@ class ISTFTHead(FourierHead):
         n_fft (int): Size of Fourier transform.
         hop_length (int): The distance between neighboring sliding window frames, which should align with
                           the resolution of the input features.
-        padding (str, optional): Type of padding. Options are "center" or "same". Defaults to "same".
+        padding (str, optional): Type of padding. Uses "same" padding.
     """
 
     def __init__(self, dim: int, n_fft: int, hop_length: int, padding: str = "same"):
@@ -147,14 +118,8 @@ class ISTFTHead(FourierHead):
         mag = torch.clip(
             mag, max=1e2
         )  # safeguard to prevent excessively large magnitudes
-        # wrapping happens here. These two lines produce real and imaginary value
         x = torch.cos(p)
         y = torch.sin(p)
-        # recalculating phase here does not produce anything new
-        # only costs time
-        # phase = torch.atan2(y, x)
-        # S = mag * torch.exp(phase * 1j)
-        # better directly produce the complex value
         S = mag * (x + 1j * y)
         audio = self.istft(S)
         return audio
@@ -168,8 +133,6 @@ class ConvNeXtBlock(nn.Module):
         intermediate_dim (int): Dimensionality of the intermediate layer.
         layer_scale_init_value (float, optional): Initial value for the layer scale. None means no scaling.
             Defaults to None.
-        adanorm_num_embeddings (int, optional): Number of embeddings for AdaLayerNorm.
-            None means non-conditional LayerNorm. Defaults to None.
     """
 
     def __init__(
@@ -177,17 +140,12 @@ class ConvNeXtBlock(nn.Module):
         dim: int,
         intermediate_dim: int,
         layer_scale_init_value: float,
-        adanorm_num_embeddings: Optional[int] = None,
     ):
         super().__init__()
         self.dwconv = nn.Conv1d(
             dim, dim, kernel_size=7, padding=3, groups=dim
         )  # depthwise conv
-        self.adanorm = adanorm_num_embeddings is not None
-        if adanorm_num_embeddings:
-            self.norm = AdaLayerNorm(adanorm_num_embeddings, dim, eps=1e-6)
-        else:
-            self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
         self.pwconv1 = nn.Linear(
             dim, intermediate_dim
         )  # pointwise/1x1 convs, implemented with linear layers
@@ -199,17 +157,11 @@ class ConvNeXtBlock(nn.Module):
             else None
         )
 
-    def forward(
-        self, x: torch.Tensor, cond_embedding_id: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.dwconv(x)
         x = x.transpose(1, 2)  # (B, C, T) -> (B, T, C)
-        if self.adanorm:
-            assert cond_embedding_id is not None
-            x = self.norm(x, cond_embedding_id)
-        else:
-            x = self.norm(x)
+        x = self.norm(x)
         x = self.pwconv1(x)
         x = self.act(x)
         x = self.pwconv2(x)
@@ -221,55 +173,9 @@ class ConvNeXtBlock(nn.Module):
         return x
 
 
-class AdaLayerNorm(nn.Module):
+class VocosBackbone(nn.Module):
     """
-    Adaptive Layer Normalization module with learnable embeddings per `num_embeddings` classes
-
-    Args:
-        num_embeddings (int): Number of embeddings.
-        embedding_dim (int): Dimension of the embeddings.
-    """
-
-    def __init__(self, num_embeddings: int, embedding_dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.dim = embedding_dim
-        self.scale = nn.Embedding(
-            num_embeddings=num_embeddings, embedding_dim=embedding_dim
-        )
-        self.shift = nn.Embedding(
-            num_embeddings=num_embeddings, embedding_dim=embedding_dim
-        )
-        torch.nn.init.ones_(self.scale.weight)
-        torch.nn.init.zeros_(self.shift.weight)
-
-    def forward(self, x: torch.Tensor, cond_embedding_id: torch.Tensor) -> torch.Tensor:
-        scale = self.scale(cond_embedding_id)
-        shift = self.shift(cond_embedding_id)
-        x = nn.functional.layer_norm(x, (self.dim,), eps=self.eps)
-        x = x * scale + shift
-        return x
-
-
-class Backbone(nn.Module):
-    """Base class for the generator's backbone. It preserves the same temporal resolution across all layers."""
-
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        Args:
-            x (Tensor): Input tensor of shape (B, C, L), where B is the batch size,
-                        C denotes output features, and L is the sequence length.
-
-        Returns:
-            Tensor: Output of shape (B, L, H), where B is the batch size, L is the sequence length,
-                    and H denotes the model dimension.
-        """
-        raise NotImplementedError("Subclasses must implement the forward method.")
-
-
-class VocosBackbone(Backbone):
-    """
-    Vocos backbone module built with ConvNeXt blocks. Supports additional conditioning with Adaptive Layer Normalization
+    Vocos backbone built with ConvNeXt blocks.
 
     Args:
         input_channels (int): Number of input features channels.
@@ -277,8 +183,6 @@ class VocosBackbone(Backbone):
         intermediate_dim (int): Intermediate dimension used in ConvNeXtBlock.
         num_layers (int): Number of ConvNeXtBlock layers.
         layer_scale_init_value (float, optional): Initial value for layer scaling. Defaults to `1 / num_layers`.
-        adanorm_num_embeddings (int, optional): Number of embeddings for AdaLayerNorm.
-                                                None means non-conditional model. Defaults to None.
     """
 
     def __init__(
@@ -288,16 +192,11 @@ class VocosBackbone(Backbone):
         intermediate_dim: int,
         num_layers: int,
         layer_scale_init_value: Optional[float] = None,
-        adanorm_num_embeddings: Optional[int] = None,
     ):
         super().__init__()
         self.input_channels = input_channels
         self.embed = nn.Conv1d(input_channels, dim, kernel_size=7, padding=3)
-        self.adanorm = adanorm_num_embeddings is not None
-        if adanorm_num_embeddings:
-            self.norm = AdaLayerNorm(adanorm_num_embeddings, dim, eps=1e-6)
-        else:
-            self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
         layer_scale_init_value = layer_scale_init_value or 1 / num_layers
         self.convnext = nn.ModuleList(
             [
@@ -305,7 +204,6 @@ class VocosBackbone(Backbone):
                     dim=dim,
                     intermediate_dim=intermediate_dim,
                     layer_scale_init_value=layer_scale_init_value,
-                    adanorm_num_embeddings=adanorm_num_embeddings,
                 )
                 for _ in range(num_layers)
             ]
@@ -318,19 +216,11 @@ class VocosBackbone(Backbone):
             nn.init.trunc_normal_(m.weight, std=0.02)
             nn.init.constant_(m.bias, 0)
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        bandwidth_id = kwargs.get("bandwidth_id", None)
-        x = self.embed(x)
-        if self.adanorm:
-            assert bandwidth_id is not None
-            x = self.norm(x.transpose(1, 2), cond_embedding_id=bandwidth_id)
-        else:
-            x = self.norm(x.transpose(1, 2))
-        x = x.transpose(1, 2)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.norm(self.embed(x).transpose(1, 2)).transpose(1, 2)
         for conv_block in self.convnext:
-            x = conv_block(x, cond_embedding_id=bandwidth_id)
-        x = self.final_layer_norm(x.transpose(1, 2))
-        return x
+            x = conv_block(x)
+        return self.final_layer_norm(x.transpose(1, 2))
 
 
 class Vocos(nn.Module):
@@ -343,7 +233,6 @@ class Vocos(nn.Module):
         n_fft: int = 800,
         hop_size: int = 200,
         padding: str = "same",
-        adanorm_num_embeddings=None,
         cfg=None,
     ):
         super().__init__()
@@ -364,11 +253,6 @@ class Vocos(nn.Module):
             if cfg is not None and hasattr(cfg, "num_layers")
             else num_layers
         )
-        adanorm_num_embeddings = (
-            cfg.adanorm_num_embeddings
-            if cfg is not None and hasattr(cfg, "adanorm_num_embeddings")
-            else adanorm_num_embeddings
-        )
         n_fft = cfg.n_fft if cfg is not None and hasattr(cfg, "n_fft") else n_fft
         hop_size = (
             cfg.hop_size if cfg is not None and hasattr(cfg, "hop_size") else hop_size
@@ -382,7 +266,6 @@ class Vocos(nn.Module):
             dim=dim,
             intermediate_dim=intermediate_dim,
             num_layers=num_layers,
-            adanorm_num_embeddings=adanorm_num_embeddings,
         )
         self.head = ISTFTHead(dim, n_fft, hop_size, padding)
 

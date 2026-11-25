@@ -6,7 +6,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 from torch.nn.utils import weight_norm
 
 
@@ -43,7 +42,6 @@ class FactorizedVectorQuantize(nn.Module):
     def forward(self, z):
         z_e = self.in_project(z)
         z_q, indices = self.decode_latents(z_e)
-        # Preserve the original inference arithmetic.
         z_q = z_e + (z_q - z_e).detach()
         return self.out_project(z_q), indices
 
@@ -54,7 +52,8 @@ class FactorizedVectorQuantize(nn.Module):
         return self.embed_code(embed_id).transpose(1, 2)
 
     def decode_latents(self, latents):
-        encodings = rearrange(latents, "b d t -> (b t) d")
+        b, d, t = latents.shape
+        encodings = latents.transpose(1, 2).reshape(b * t, d)
         codebook = self.codebook.weight
 
         # L2 normalize encodings and codebook
@@ -69,7 +68,58 @@ class FactorizedVectorQuantize(nn.Module):
             - 2 * encodings @ codebook.t()
             + codebook.pow(2).sum(1, keepdim=True).t()
         )
-        indices = rearrange((-dist).max(1)[1], "(b t) -> b t", b=latents.size(0))
+        indices = (-dist).max(1)[1].reshape(b, t)
         z_q = self.decode_code(indices)
 
         return z_q, indices
+
+
+class ResidualVQ(nn.Module):
+    """
+    Introduced in SoundStream: An end2end neural audio codec
+    https://arxiv.org/abs/2107.03312
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 256,
+        num_quantizers: int = 8,
+        codebook_size: int = 1024,
+        codebook_dim: int = 256,
+        quantizer_type: str = "fvq",
+        **kwargs,
+    ):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.num_quantizers = num_quantizers
+        self.codebook_size = codebook_size
+        self.codebook_dim = codebook_dim
+        self.quantizer_type = quantizer_type
+
+        if quantizer_type != "fvq":
+            raise ValueError(f"Unsupported quantizer type: {quantizer_type}")
+
+        self.quantizers = nn.ModuleList(
+            [
+                FactorizedVectorQuantize(
+                    input_dim=input_dim,
+                    codebook_size=codebook_size,
+                    codebook_dim=codebook_dim,
+                    **kwargs,
+                )
+                for _ in range(num_quantizers)
+            ]
+        )
+
+    def forward(self, z):
+        """Quantize residuals and return the quantized representation and indices."""
+        quantized_out = 0.0
+        residual = z
+        all_indices = []
+        for quantizer in self.quantizers:
+            z_q, indices = quantizer(residual)
+            quantized_out = quantized_out + z_q
+            residual = residual - z_q
+            all_indices.append(indices)
+        return quantized_out, torch.stack(all_indices)

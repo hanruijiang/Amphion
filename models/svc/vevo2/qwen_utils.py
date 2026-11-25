@@ -31,7 +31,7 @@ def gen_chat_prompt(text, add_assistant_token, follow_prosody_instruction):
     """
     Args:
         text (str): The text to be spoken.
-        add_assistant_token (bool): Whether to add assistant token at the end. For pre-training, False. For Inference, True.
+        add_assistant_token (bool): Whether to add assistant token at the end. 
         follow_prosody_instruction (bool): Whether to follow the prosody instruction. When prosody_ids is not None, True. Otherwise, False.
     """
     if follow_prosody_instruction:

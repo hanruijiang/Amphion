@@ -7,8 +7,8 @@ import numpy as np
 import torch.nn as nn
 
 
-from models.codec.amphion_codec.quantize import ResidualVQ
-from models.codec.amphion_codec.vocos import VocosBackbone
+from .quantizer import ResidualVQ
+from .vocos import VocosBackbone
 
 
 def init_weights(m):
@@ -62,7 +62,6 @@ class CocoContentStyle(nn.Module):
             assert np.log2(downsample_rate).is_integer()
 
             down_layers = []
-            up_layers = []
             for _ in range(int(np.log2(downsample_rate))):
                 down_layers.extend(
                     [
@@ -76,17 +75,7 @@ class CocoContentStyle(nn.Module):
                         nn.GELU(),
                     ]
                 )
-                up_layers.extend(
-                    [
-                        nn.ConvTranspose1d(
-                            hidden_size, hidden_size, kernel_size=4, stride=2, padding=1
-                        ),
-                        nn.GELU(),
-                    ]
-                )
             self.downsample_layers = nn.Sequential(*down_layers)
-            # Retain published checkpoint parameter names; not used in inference.
-            self.upsample_layers = nn.Sequential(*up_layers)
 
         else:
             self.do_downsample = False
@@ -97,7 +86,6 @@ class CocoContentStyle(nn.Module):
                 dim=self.cfg.encoder.vocos_dim,
                 intermediate_dim=self.cfg.encoder.vocos_intermediate_dim,
                 num_layers=self.cfg.encoder.vocos_num_layers,
-                adanorm_num_embeddings=None,
             ),
             nn.Linear(self.cfg.encoder.vocos_dim, self.hidden_size),
         )

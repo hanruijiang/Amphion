@@ -1,5 +1,4 @@
 import unittest
-from pathlib import Path
 from unittest.mock import Mock
 from models.svc.vevo2.cli import build_parser, run_task
 

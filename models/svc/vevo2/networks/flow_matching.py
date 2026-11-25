@@ -6,7 +6,7 @@
 import torch
 import numpy as np
 import torch.nn as nn
-from models.vc.flow_matching_transformer.llama_nar import DiffLlama
+from .llama_nar import DiffLlama
 
 
 class FlowMatchingTransformer(nn.Module):
@@ -57,16 +57,6 @@ class FlowMatchingTransformer(nn.Module):
             self.resampling_layers = nn.Sequential(*up_layers)
         else:
             self.do_resampling = False
-
-        # Retain the published checkpoint's training head parameters.
-        if cfg is not None and "repa" in cfg:
-            self.repa_mlp_layer = nn.Sequential(
-                nn.Linear(hidden_size, hidden_size * 4),
-                nn.SiLU(),
-                nn.Linear(hidden_size * 4, cfg.repa.output_dim),
-            )
-        if cfg is not None and "ctc" in cfg:
-            raise ValueError("CTC-conditioned FM checkpoints are not supported.")
 
         self.reset_parameters()
 
